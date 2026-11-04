@@ -17,7 +17,10 @@ target_include_directories(vulkan_app PRIVATE
     inc 
 )
 
+add_subdirectory(libs/tinyobjloader)
+
 target_link_libraries(vulkan_app PRIVATE 
     Vulkan::Vulkan
     glfw
+    tinyobjloader
 )
