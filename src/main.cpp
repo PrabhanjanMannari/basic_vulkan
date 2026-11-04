@@ -6,6 +6,7 @@
 #include <string_view>
 #include <string>
 #include <fstream>
+#include <utility>
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_core.h>
@@ -17,7 +18,6 @@
 #include <glm/glm.hpp>
 
 #include <tiny_obj_loader.h>
-
 
 constexpr int WIN_WIDTH{1280};
 constexpr int WIN_HEIGHT{760};
@@ -33,19 +33,19 @@ class VulkanApp {
 public:
     GLFWwindow *m_win{nullptr};
 
-    VkInstance m_instance{nullptr};
+    VkInstance m_instance{VK_NULL_HANDLE};
 
-    VkPhysicalDevice m_physicalDevice{nullptr};
+    VkPhysicalDevice m_physicalDevice{VK_NULL_HANDLE};
     uint32_t m_queueFamilyIdx{0};
 
-    VkDevice m_device{nullptr};
-    VkQueue m_deviceQueue{nullptr};
+    VkDevice m_device{VK_NULL_HANDLE};
+    VkQueue m_deviceQueue{VK_NULL_HANDLE};
 
-    VkSurfaceKHR m_surface{nullptr};
+    VkSurfaceKHR m_surface{VK_NULL_HANDLE};
     VkSurfaceCapabilitiesKHR m_surfaceCaps{};
 
     struct Swapchain {
-        VkSwapchainKHR handle{nullptr};
+        VkSwapchainKHR handle{VK_NULL_HANDLE};
         VkExtent2D extent{};
         VkFormat format{};
         std::vector<VkImage> images{};
@@ -53,17 +53,56 @@ public:
     };
     Swapchain m_swapchain{};
 
-    VkPipelineLayout m_graphicsPipelineLayout{nullptr};
-    VkPipeline m_graphicsPipeline{nullptr};
+    VkPipelineLayout m_graphicsPipelineLayout{VK_NULL_HANDLE};
+    VkPipeline m_graphicsPipeline{VK_NULL_HANDLE};
 
-    VkBuffer m_vertexBuffer{nullptr};
-    VkDeviceMemory m_vertexBufferMemory{nullptr};
+    struct AllocatedBuffer {
+        VkDevice associatedDevice{VK_NULL_HANDLE};
+        VkDeviceMemory memory{VK_NULL_HANDLE};
+        VkBuffer handle{VK_NULL_HANDLE};
 
-    VkCommandPool m_commandPool{nullptr};
-    VkCommandBuffer m_commandBuffer{nullptr};
+        AllocatedBuffer(VkDevice associatedDevice)
+            : associatedDevice{associatedDevice}, memory{VK_NULL_HANDLE}, handle{VK_NULL_HANDLE} {}
 
-    VkFence m_drawFence{nullptr};
-    VkSemaphore m_acquireSemaphore{nullptr};
+        ~AllocatedBuffer(void) {
+           reset(); 
+        }
+
+        AllocatedBuffer(const AllocatedBuffer &buffer) = delete;
+        AllocatedBuffer& operator=(const AllocatedBuffer &buffer) = delete;
+
+        AllocatedBuffer(AllocatedBuffer &&buffer) noexcept {
+            associatedDevice = std::exchange(buffer.associatedDevice, VK_NULL_HANDLE);
+            memory = std::exchange(buffer.memory, VK_NULL_HANDLE);
+            handle = std::exchange(buffer.handle, VK_NULL_HANDLE); 
+        }
+        AllocatedBuffer& operator=(AllocatedBuffer &&buffer) {
+            reset();
+            associatedDevice = std::exchange(buffer.associatedDevice, VK_NULL_HANDLE);
+            memory = std::exchange(buffer.memory, VK_NULL_HANDLE);
+            handle = std::exchange(buffer.handle, VK_NULL_HANDLE); 
+            return *this;
+        }
+
+        void reset() {
+            if (memory != VK_NULL_HANDLE && handle != VK_NULL_HANDLE) {
+                vkFreeMemory(associatedDevice, memory, nullptr);
+                vkDestroyBuffer(associatedDevice, handle, nullptr);
+            }
+            handle = VK_NULL_HANDLE;
+            memory = VK_NULL_HANDLE;
+            associatedDevice = VK_NULL_HANDLE;
+        }
+    };
+
+    AllocatedBuffer m_vertexBuffer{VK_NULL_HANDLE};
+    AllocatedBuffer m_indexBuffer{VK_NULL_HANDLE};
+
+    VkCommandPool m_commandPool{VK_NULL_HANDLE};
+    VkCommandBuffer m_commandBuffer{VK_NULL_HANDLE};
+
+    VkFence m_drawFence{VK_NULL_HANDLE};
+    VkSemaphore m_acquireSemaphore{VK_NULL_HANDLE};
     std::vector<VkSemaphore> m_renderFinishedSemaphoreList{};
 
     inline static constexpr std::array<char const*, 1> m_reqdDevExtensions {
@@ -90,10 +129,15 @@ public:
         }
     };
 
-    const std::vector<Vertex> m_vertices{
-        {{ 0.0f,-0.5f}, {1.0f, 0.0f, 0.0f}},
+    const std::vector<Vertex> m_vertices {
+        {{-0.5f,-0.5f}, {1.0f, 0.0f, 0.0f}},
+        {{ 0.5f,-0.5f}, {0.0f, 1.0f, 1.0f}},
         {{ 0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
         {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+    };
+
+    const std::vector<uint16_t> m_indices {
+        0, 1, 2, 2, 3, 0,
     };
 
     VulkanApp(void) {
@@ -518,7 +562,7 @@ public:
             .pColorBlendState = &blendInfo,
             .pDynamicState = &dynamicInfo,
             .layout = m_graphicsPipelineLayout,
-            .renderPass = nullptr,
+            .renderPass = VK_NULL_HANDLE,
         };
         chk(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &createInfo, nullptr, &m_graphicsPipeline));
         vkDestroyShaderModule(m_device, shaderModule, nullptr);
@@ -553,32 +597,103 @@ public:
         throw std::runtime_error("Unable to find suitable memory for buffer");
     }
 
-    void createVertexBuffer(void) {
+    AllocatedBuffer createBuffer(VkDeviceSize size, VkBufferUsageFlagBits usage, VkMemoryPropertyFlags properties) {
+        AllocatedBuffer buffer{m_device};
         VkBufferCreateInfo bufInfo {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = sizeof(Vertex) * m_vertices.size(),
-            .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 
+            .size = size,
+            .usage = usage, 
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         };
-        chk(vkCreateBuffer(m_device, &bufInfo, nullptr, &m_vertexBuffer));
+        chk(vkCreateBuffer(m_device, &bufInfo, nullptr, &buffer.handle));
 
         VkMemoryRequirements memRequirements{}; 
-        vkGetBufferMemoryRequirements(m_device, m_vertexBuffer, &memRequirements);
+        vkGetBufferMemoryRequirements(m_device, buffer.handle, &memRequirements);
         VkMemoryAllocateInfo allocInfo {
             .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             .allocationSize = memRequirements.size,
             .memoryTypeIndex = 
-                findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                findMemoryType(memRequirements.memoryTypeBits, properties),
         };
-        chk(vkAllocateMemory(m_device, &allocInfo, nullptr, &m_vertexBufferMemory));
+        chk(vkAllocateMemory(m_device, &allocInfo, nullptr, &buffer.memory));
 
-        vkBindBufferMemory(m_device, m_vertexBuffer, m_vertexBufferMemory, 0);
+        vkBindBufferMemory(m_device, buffer.handle, buffer.memory, 0);
+        return buffer; //@TODO Check if this supports NRVO
+    }
+
+    void copyBuffer(AllocatedBuffer &src, AllocatedBuffer &dst, VkDeviceSize size) {
+        VkCommandBufferAllocateInfo allocInfo {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = m_commandPool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+        VkCommandBuffer copyCommandBuffer{VK_NULL_HANDLE};
+        chk(vkAllocateCommandBuffers(m_device, &allocInfo, &copyCommandBuffer));
+
+        VkCommandBufferBeginInfo beginInfo {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        vkBeginCommandBuffer(copyCommandBuffer, &beginInfo);
+        VkBufferCopy copyInfo {0, 0, size};
+        vkCmdCopyBuffer(copyCommandBuffer, src.handle, dst.handle, 1, &copyInfo);
+        vkEndCommandBuffer(copyCommandBuffer);
+
+        VkSubmitInfo submitInfo {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 0, 
+            .commandBufferCount = 1,
+            .pCommandBuffers = &copyCommandBuffer,
+            .signalSemaphoreCount = 0, 
+        };
+        chk(vkQueueSubmit(m_deviceQueue, 1, &submitInfo, nullptr));
+        chk(vkQueueWaitIdle(m_deviceQueue)); 
+    }
+
+    void createVertexBuffer(void) {
+        VkDeviceSize bufferSize{sizeof(m_vertices) * m_vertices.size()};
+        AllocatedBuffer stagingBuffer {
+            createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        };
+
+        m_vertexBuffer = std::move(
+                createBuffer(bufferSize, 
+                             static_cast<VkBufferUsageFlagBits>(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT), 
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                )
+        );
 
         /** FILL THE VERTICES INTO THE BUFFER */
-        void* data{}; /** @TODO Use std::vector<std::byte> ?? */
-        chk(vkMapMemory(m_device, m_vertexBufferMemory, 0, bufInfo.size, 0, &data));
-        std::memcpy(data, m_vertices.data(), bufInfo.size);
-        vkUnmapMemory(m_device, m_vertexBufferMemory);
+        void* dataStaging{}; /** @TODO Use std::vector<std::byte> ?? */
+        chk(vkMapMemory(m_device, stagingBuffer.memory, 0, bufferSize, 0, &dataStaging));
+        std::memcpy(dataStaging, m_vertices.data(), bufferSize);
+        vkUnmapMemory(m_device, stagingBuffer.memory);
+
+        copyBuffer(stagingBuffer, m_vertexBuffer, bufferSize);
+    }
+
+    void createIndexBuffer(void) {
+        VkDeviceSize bufferSize{sizeof(uint16_t) * m_indices.size()};
+
+        AllocatedBuffer stagingBuffer {
+            createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        };
+
+        m_indexBuffer = std::move(
+                createBuffer(bufferSize, 
+                             static_cast<VkBufferUsageFlagBits>(VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT), 
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                )
+        );
+
+        /** FILL THE VERTICES INTO THE BUFFER */
+        void* dataStaging{}; /** @TODO Use std::vector<std::byte> ?? */
+        chk(vkMapMemory(m_device, stagingBuffer.memory, 0, bufferSize, 0, &dataStaging));
+        std::memcpy(dataStaging, m_indices.data(), bufferSize);
+        vkUnmapMemory(m_device, stagingBuffer.memory);
+
+        copyBuffer(stagingBuffer, m_indexBuffer, bufferSize);
     }
 
     void createCommandBuffer(void) {
@@ -671,7 +786,8 @@ public:
         vkCmdBeginRendering(m_commandBuffer, &renderInfo);
         vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipeline);
         VkDeviceSize vBufOffset{0};
-        vkCmdBindVertexBuffers(m_commandBuffer, 0, 1, &m_vertexBuffer, &vBufOffset);
+        vkCmdBindVertexBuffers(m_commandBuffer, 0, 1, &m_vertexBuffer.handle, &vBufOffset);
+        vkCmdBindIndexBuffer(m_commandBuffer, m_indexBuffer.handle, 0, VK_INDEX_TYPE_UINT16);
         /**
          * @TODO: 
          * @TODO: Dynamic Rendering Viewport and Scissor
@@ -691,7 +807,8 @@ public:
         };
         vkCmdSetScissor(m_commandBuffer, 0, 1, &scissor);
 
-        vkCmdDraw(m_commandBuffer, static_cast<uint32_t>(m_vertices.size()), 1, 0, 0);
+        //vkCmdDraw(m_commandBuffer, static_cast<uint32_t>(m_vertices.size()), 1, 0, 0);
+        vkCmdDrawIndexed(m_commandBuffer, static_cast<uint32_t>(m_indices.size()), 1, 0, 0, 0);
         vkCmdEndRendering(m_commandBuffer);
 
         transitionImageLayout(
@@ -770,6 +887,7 @@ public:
         createGraphicsPipeline();
         createCommandPool();
         createVertexBuffer();
+        createIndexBuffer();
         createCommandBuffer();
         createSyncPrimitives();
     }
@@ -789,8 +907,8 @@ public:
         vkDestroyFence(m_device, m_drawFence, nullptr);
 
         /** Buffers and Images */
-        vkFreeMemory(m_device, m_vertexBufferMemory, nullptr);
-        vkDestroyBuffer(m_device, m_vertexBuffer, nullptr);
+        m_vertexBuffer.reset();
+        m_indexBuffer.reset();
 
         vkDestroyCommandPool(m_device, m_commandPool, nullptr);
         vkDestroyPipeline(m_device, m_graphicsPipeline, nullptr);
