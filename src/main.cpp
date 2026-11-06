@@ -5,6 +5,7 @@
 #include <vector>
 #include <string_view>
 #include <string>
+#include <sstream>
 #include <fstream>
 #include <utility>
 #include <chrono>
@@ -16,13 +17,14 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <tiny_obj_loader.h>
 
 constexpr int WIN_WIDTH{1280};
-constexpr int WIN_HEIGHT{760};
+constexpr int WIN_HEIGHT{768};
 
 #define NDEBUG 
 constexpr void chk(VkResult result) {
@@ -54,6 +56,11 @@ public:
         std::vector<VkImageView> imageViews{};
     };
     Swapchain m_swapchain{};
+
+    VkImage m_depthImage{VK_NULL_HANDLE};
+    VkFormat m_depthFormat{VK_FORMAT_D32_SFLOAT_S8_UINT};
+    VkDeviceMemory m_depthImageMemory{VK_NULL_HANDLE};
+    VkImageView m_depthImageView{VK_NULL_HANDLE};
 
     VkDescriptorSetLayout m_descriptorSetLayout{VK_NULL_HANDLE};
     VkPipelineLayout m_graphicsPipelineLayout{VK_NULL_HANDLE};
@@ -124,13 +131,13 @@ public:
     };
 
     struct UniformBufferObject {
-        glm::mat4 model{};
-        glm::mat4 view{};
-        glm::mat4 proj{};
+        alignas(16) glm::mat4 model{};
+        alignas(16) glm::mat4 view{};
+        alignas(16) glm::mat4 proj{};
     };
 
     struct Vertex {
-        glm::vec2 pos{};
+        glm::vec3 pos{};
         glm::vec3 color{};
         static VkVertexInputBindingDescription getBindingDescription(void) {
             VkVertexInputBindingDescription desc {
@@ -142,19 +149,20 @@ public:
         }
         static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescription(void) {
             std::array<VkVertexInputAttributeDescription, 2> desc {
-                VkVertexInputAttributeDescription{.location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = offsetof(Vertex, pos)},
+                VkVertexInputAttributeDescription{.location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(Vertex, pos)},
                 VkVertexInputAttributeDescription{.location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(Vertex, color)},
             };
             return desc;
         }
     };
 
-    const std::vector<Vertex> m_vertices {
-        {{-0.5f,-0.5f}, {1.0f, 0.0f, 0.0f}},
-        {{ 0.5f,-0.5f}, {0.0f, 1.0f, 1.0f}},
-        {{ 0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
-        {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    };
+    /*const std::vector<Vertex> m_vertices {
+        {{-0.5f,-0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}},
+        {{ 0.5f,-0.5f, 0.0f}, {0.0f, 1.0f, 1.0f}},
+        {{ 0.5f, 0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}},
+        {{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}},
+    };*/
+    std::vector<Vertex> m_vertices{};
 
     const std::vector<uint16_t> m_indices {
         0, 1, 2, 2, 3, 0,
@@ -468,6 +476,56 @@ public:
         vkCreateDescriptorSetLayout(m_device, &createInfo, nullptr, &m_descriptorSetLayout);
     }
 
+    void createDepthImage(void) {
+        VkFormatProperties2 formatProperties {
+            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+        };
+        vkGetPhysicalDeviceFormatProperties2(m_physicalDevice, m_depthFormat, &formatProperties);
+        if ( !(formatProperties.formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ){
+            throw std::runtime_error("Depth attachment specified is not supported");
+        }
+        VkImageCreateInfo createInfo {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D, 
+            .format = m_depthFormat, 
+            .extent = VkExtent3D {
+                .width = m_swapchain.extent.width, 
+                .height = m_swapchain.extent.height,
+                .depth = 1,
+            },
+            .mipLevels = 1, 
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL, 
+            .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        chk(vkCreateImage(m_device, &createInfo, nullptr, &m_depthImage));
+
+        VkMemoryRequirements imgMemoryRequirements {};
+        vkGetImageMemoryRequirements(m_device, m_depthImage, &imgMemoryRequirements);
+        VkMemoryAllocateInfo allocInfo {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 
+            .allocationSize = imgMemoryRequirements.size,
+            .memoryTypeIndex = findMemoryType(imgMemoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        };
+        chk(vkAllocateMemory(m_device, &allocInfo, nullptr, &m_depthImageMemory));
+        vkBindImageMemory(m_device, m_depthImage, m_depthImageMemory, 0);
+
+        VkImageViewCreateInfo viewCreateInfo {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, 
+            .image = m_depthImage,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = m_depthFormat,
+            .subresourceRange = {
+                .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT, 
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+        chk(vkCreateImageView(m_device, &viewCreateInfo, nullptr, &m_depthImageView));
+    }
+
     void createGraphicsPipeline(void) {
         /*
          * CREATE SHADER MODULE 
@@ -513,7 +571,8 @@ public:
         };
         VkPipelineInputAssemblyStateCreateInfo inputAssemblyInfo {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-            .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            //.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            .topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
         };
         VkViewport viewport{
             .x = 0,
@@ -549,6 +608,12 @@ public:
             .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
             .sampleShadingEnable = VK_FALSE,
         };
+        VkPipelineDepthStencilStateCreateInfo depthStencilInfo {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+            .depthTestEnable = VK_TRUE,
+            .depthWriteEnable = VK_TRUE,
+            .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL,
+        };
         VkPipelineColorBlendAttachmentState blendAttachment {
             .blendEnable = VK_FALSE,
             .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
@@ -574,6 +639,7 @@ public:
             .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
             .colorAttachmentCount = 1, 
             .pColorAttachmentFormats = &m_swapchain.format,
+            .depthAttachmentFormat = m_depthFormat,
         };
 
 
@@ -595,6 +661,7 @@ public:
             .pViewportState = &viewportInfo,
             .pRasterizationState = &rasterInfo, 
             .pMultisampleState = &multisampleInfo,
+            .pDepthStencilState = &depthStencilInfo,
             .pColorBlendState = &blendInfo,
             .pDynamicState = &dynamicInfo,
             .layout = m_graphicsPipelineLayout,
@@ -688,6 +755,7 @@ public:
     }
 
     void createVertexBuffer(void) {
+        m_vertices = readPointCloud("assets/pointcloud");
         VkDeviceSize bufferSize{sizeof(m_vertices) * m_vertices.size()};
         AllocatedBuffer stagingBuffer {
             createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
@@ -793,13 +861,14 @@ public:
     /**
      * @TODO Dont do this for one image at a time 
      */
-    void transitionImageLayout(uint32_t              imageIdx,
+    void transitionImageLayout(VkImage curImage,
                                VkPipelineStageFlags2 srcStageMask, 
                                VkPipelineStageFlags2 dstStageMask,
                                VkAccessFlags2        srcAccessMask, 
                                VkAccessFlags2        dstAccessMask,
                                VkImageLayout         oldLayout, 
-                               VkImageLayout         newLayout) {
+                               VkImageLayout         newLayout,
+                               VkImageAspectFlags    aspectFlag) {
         VkImageMemoryBarrier2 barrier {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
             .srcStageMask = srcStageMask,
@@ -808,9 +877,9 @@ public:
             .dstAccessMask = dstAccessMask, 
             .oldLayout = oldLayout, 
             .newLayout = newLayout,
-            .image = m_swapchain.images[imageIdx],
+            .image = curImage,
             .subresourceRange = {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, 
+                .aspectMask = aspectFlag, 
                 .baseMipLevel = 0,
                 .levelCount = 1, 
                 .baseArrayLayer = 0, 
@@ -835,16 +904,27 @@ public:
         chk(vkBeginCommandBuffer(m_commandBuffer, &beginInfo));
         
         transitionImageLayout(
-            imageIdx,
+            m_swapchain.images[imageIdx],
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_NONE,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL
+            VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_ASPECT_COLOR_BIT
+        );
+        transitionImageLayout(
+            m_depthImage, 
+            VK_PIPELINE_STAGE_2_NONE,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, 
+            VK_ACCESS_2_NONE,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
         );
 
-        VkClearValue clearColor{
+        VkClearValue clearColor {
             .color = {0.0f, 0.0f, 0.0f, 1.0f},
         };
         VkRenderingAttachmentInfo attachmentInfo {
@@ -855,6 +935,19 @@ public:
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = clearColor,
         };
+
+        VkClearValue clearDepthStencil {
+            .depthStencil = {1.0f, 0},
+        };
+        VkRenderingAttachmentInfo depthAttachmentInfo {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = m_depthImageView, 
+            .imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .clearValue = clearDepthStencil,
+        };
+
         
         VkRenderingInfo renderInfo {
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -865,6 +958,7 @@ public:
             .layerCount = 1,
             .colorAttachmentCount = 1,
             .pColorAttachments = &attachmentInfo,
+            .pDepthAttachment = &depthAttachmentInfo,
         };
 
         vkCmdBeginRendering(m_commandBuffer, &renderInfo);
@@ -892,18 +986,19 @@ public:
         };
         vkCmdSetScissor(m_commandBuffer, 0, 1, &scissor);
 
-        //vkCmdDraw(m_commandBuffer, static_cast<uint32_t>(m_vertices.size()), 1, 0, 0);
-        vkCmdDrawIndexed(m_commandBuffer, static_cast<uint32_t>(m_indices.size()), 1, 0, 0, 0);
+        vkCmdDraw(m_commandBuffer, static_cast<uint32_t>(m_vertices.size()), 1, 0, 0);
+        //vkCmdDrawIndexed(m_commandBuffer, static_cast<uint32_t>(m_indices.size()), 1, 0, 0, 0);
         vkCmdEndRendering(m_commandBuffer);
 
         transitionImageLayout(
-            imageIdx,
+            m_swapchain.images[imageIdx],
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             VK_ACCESS_2_NONE,
             VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_IMAGE_ASPECT_COLOR_BIT
         );
         chk(vkEndCommandBuffer(m_commandBuffer));
     }
@@ -934,9 +1029,32 @@ public:
         auto currentTime{std::chrono::high_resolution_clock::now()};
         float time{std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count()};
         UniformBufferObject ubo{};
-        ubo.model = glm::rotate(glm::mat4{1.0f}, time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        /*ubo.model = glm::rotate(glm::mat4{1.0f}, time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
         ubo.view = glm::lookAt(glm::vec3{2.0f, 2.0f, 2.0f}, glm::vec3{0.0f, 0.0f, 0.0f}, glm::vec3{0.0f, 0.0f, 1.0f});
-        ubo.proj = glm::perspective(glm::radians(45.0f), static_cast<float>(m_swapchain.extent.width) / static_cast<float>(m_swapchain.extent.height), 0.1f, 10.0f);
+        ubo.proj = glm::perspective(glm::radians(45.0f), static_cast<float>(m_swapchain.extent.width) / static_cast<float>(m_swapchain.extent.height), 0.1f, 10.0f);*/
+        
+        ubo.model = glm::mat4(1.0f);
+
+        // View
+        ubo.view = glm::lookAt(
+            glm::vec3(8.0f, -3.0f, 4.0f),
+            glm::vec3(0.0f,  0.0f,  0.0f),
+            glm::vec3(0.0f, -1.0f,  0.0f)
+        );
+        ubo.view = glm::rotate(ubo.view, glm::radians(10.0f * time), glm::vec3(0.0, 1.0, 0.0f));
+
+        // Projection
+        float w = 1280.0f, h = 768.0f;
+        float fx = 500.0f, fy = 500.0f;
+        float cx = w / 2.0f, cy = h / 2.0f;
+        float n = 0.1f, f = 1000.0f;
+
+
+        float fovY = 2.0f * std::atan(h / (2.0f * fy));
+        float aspect = w / h;
+
+        ubo.proj = glm::perspective(fovY, aspect, n, f);
+
         std::memcpy(m_uniformBuffer.mappedData, &ubo, sizeof(ubo));
     }
 
@@ -975,6 +1093,32 @@ public:
         chk(vkQueuePresentKHR(m_deviceQueue, &presentInfo));
     }
 
+    std::vector<Vertex> readPointCloud(const std::string& filename) {
+        std::ifstream file{filename};
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open file: " + filename);
+        }
+
+        std::vector<Vertex> vertices{};
+        std::string line{};
+
+        while (std::getline(file, line)) {
+            std::stringstream ss{line};
+            Vertex v{};
+            char comma{};
+
+            if (ss >> v.pos.x >> comma
+                   >> v.pos.y >> comma
+                   >> v.pos.z >> comma
+                   >> v.color.r >> comma
+                   >> v.color.g >> comma
+                   >> v.color.b) {
+                vertices.push_back(v);
+            }
+        }
+        return vertices;
+    }
+
     void initVulkan(void) {
         createInstance();
         createSurface();
@@ -983,6 +1127,7 @@ public:
         setupVma();
         createSwapchain();
         createDescriptorSetLayout();
+        createDepthImage();
         createGraphicsPipeline();
         createCommandPool();
         createCommandBuffer();
@@ -1012,6 +1157,10 @@ public:
         m_vertexBuffer.reset();
         m_indexBuffer.reset();
         m_uniformBuffer.reset();
+
+        vkFreeMemory(m_device, m_depthImageMemory, nullptr);
+        vkDestroyImageView(m_device, m_depthImageView, nullptr);
+        vkDestroyImage(m_device, m_depthImage, nullptr);
 
         vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
 
